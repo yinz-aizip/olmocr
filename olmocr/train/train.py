@@ -252,7 +252,7 @@ def main():
         pipeline_steps = config.get_pipeline_steps(dataset_cfg["pipeline"], processor)
 
         logger.info(f"Creating training dataset {i+1} from: {root_dir}")
-        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps)
+        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps, cache_dir=config.dataset.cache_dir)
         logger.info(f"Found {len(dataset)} samples")
 
         if len(dataset) > 0:
@@ -273,7 +273,7 @@ def main():
         dataset_name = dataset_cfg.get("name", f"eval_dataset_{i+1}")
 
         logger.info(f"Creating evaluation dataset '{dataset_name}' from: {root_dir}")
-        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps)
+        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps, cache_dir=config.dataset.cache_dir)
         logger.info(f"Found {len(dataset)} samples")
 
         if len(dataset) > 0:

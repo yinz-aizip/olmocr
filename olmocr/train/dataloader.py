@@ -1,6 +1,8 @@
 import base64
+import hashlib
 import json
 import logging
+import pickle
 import re
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -34,6 +36,9 @@ from olmocr.prompts.prompts import PageResponse, build_finetuning_prompt
 
 # Type alias for samples
 Sample: TypeAlias = Dict[str, Any]
+
+# Sentinel used for distinguishing cache misses
+_CACHE_MISS = object()
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -90,21 +95,83 @@ class PipelineStep(ABC):
         """Process a sample and return the modified sample, or None to skip this sample."""
         ...
 
+    def is_cacheable(self) -> bool:
+        """Whether the step can be included in cached preprocessing."""
+        return True
+
+    def cache_fingerprint(self) -> str:
+        """Return a deterministic fingerprint representing this step's configuration."""
+        if not hasattr(self, "__dataclass_fields__"):
+            return self.__class__.__name__
+
+        parts = []
+        for field_name in sorted(self.__dataclass_fields__.keys()):  # type: ignore[attr-defined]
+            value = getattr(self, field_name)
+            parts.append(f"{field_name}={self._normalize_cache_value(value)}")
+
+        joined = ",".join(parts)
+        return f"{self.__class__.__name__}({joined})"
+
+    def _normalize_cache_value(self, value: Any) -> str:
+        """Normalize values to stable string representations for caching."""
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return str(value)
+        if isinstance(value, Path):
+            return str(value.resolve())
+        if isinstance(value, (list, tuple)):
+            return "[" + ",".join(self._normalize_cache_value(v) for v in value) + "]"
+        if isinstance(value, dict):
+            return "{" + ",".join(
+                f"{k}:{self._normalize_cache_value(v)}" for k, v in sorted(value.items())
+            ) + "}"
+        if isinstance(value, type):
+            return f"{value.__module__}.{value.__qualname__}"
+        processor_name = getattr(value, "pretrained_model_name_or_path", None)
+        if processor_name:
+            return str(processor_name)
+        tokenizer_name = getattr(value, "name_or_path", None)
+        if tokenizer_name:
+            return str(tokenizer_name)
+        return value.__class__.__name__
+
 
 class BaseMarkdownPDFDataset(Dataset):
     """Base dataset class that loads and verifies markdown-PDF pairs."""
 
-    def __init__(self, root_dir: str | PathLike, pipeline_steps: Optional[List[PipelineStep]] = None):
+    def __init__(
+        self,
+        root_dir: str | PathLike,
+        pipeline_steps: Optional[List[PipelineStep]] = None,
+        cache_dir: Optional[str | PathLike] = None,
+    ):
         """
         Initialize the dataset by finding all markdown files with corresponding PDFs.
 
         Args:
             root_dir: Path to the root folder containing processed markdown and PDF files
             pipeline_steps: Optional list of pipeline steps to apply to each sample
+            cache_dir: Optional directory for cached preprocessing results
         """
         self.root_dir = Path(root_dir)
-        self.pipeline_steps = pipeline_steps or []
-        self.samples = []
+        self.pipeline_steps = list(pipeline_steps or [])
+        self.samples: List[Sample] = []
+
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.cache_enabled = self.cache_dir is not None
+        self.cacheable_steps, self.runtime_steps = self._split_pipeline_steps()
+        if self.cache_enabled and not self.cacheable_steps:
+            logger.info("Cache requested for %s but no cacheable steps detected; disabling cache.", self.root_dir)
+            self.cache_enabled = False
+            self.cacheable_steps = list(self.pipeline_steps)
+            self.runtime_steps = []
+        if not self.cache_enabled:
+            self.cacheable_steps = list(self.pipeline_steps)
+            self.runtime_steps = []
+
+        self.cache_identifier: Optional[str] = None
+        self.cache_base_path: Optional[Path] = None
+        self.cache_samples_dir: Optional[Path] = None
+        self._cache_index_paths: List[Path] = []
 
         # Find all markdown files recursively
         logger.info(f"Scanning for markdown files in {self.root_dir}...")
@@ -152,6 +219,8 @@ class BaseMarkdownPDFDataset(Dataset):
             if len(invalid_pdfs) > 5:
                 logger.warning(f"  ... and {len(invalid_pdfs) - 5} more")
 
+        self._initialize_cache()
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -167,16 +236,171 @@ class BaseMarkdownPDFDataset(Dataset):
             Additional fields will be added by pipeline steps.
             Returns None if any pipeline step returns None.
         """
-        # Start with basic sample info
-        sample = self.samples[idx].copy()
+        base_sample = self.samples[idx].copy()
 
-        # Apply pipeline steps, returning None if any step returns None
-        for step in self.pipeline_steps:
+        if self.cache_enabled and self.cache_samples_dir is not None:
+            cached_sample = self._load_cached_sample(idx)
+            if cached_sample is _CACHE_MISS:
+                cached_sample = self._apply_cacheable_steps(base_sample)
+                self._store_cached_sample(idx, cached_sample)
+            sample = cached_sample
+        else:
+            sample = self._apply_cacheable_steps(base_sample)
+
+        if sample is None:
+            return None
+
+        for step in self.runtime_steps:
             sample = step(sample)
             if sample is None:
                 return None
 
         return sample
+
+    def _split_pipeline_steps(self) -> tuple[List[PipelineStep], List[PipelineStep]]:
+        """Split pipeline steps into cacheable prefix and runtime suffix."""
+        if not self.cache_enabled:
+            return list(self.pipeline_steps), []
+
+        cacheable: List[PipelineStep] = []
+        runtime: List[PipelineStep] = []
+        cache_prefix_active = True
+
+        for step in self.pipeline_steps:
+            if cache_prefix_active and step.is_cacheable():
+                cacheable.append(step)
+            else:
+                cache_prefix_active = False
+                runtime.append(step)
+
+        if not cacheable:
+            return list(self.pipeline_steps), []
+
+        return cacheable, runtime
+
+    def _initialize_cache(self) -> None:
+        """Prepare cache directories and metadata if caching is enabled."""
+        if not self.cache_enabled or not self.cacheable_steps:
+            self.cache_identifier = None
+            self.cache_base_path = None
+            self.cache_samples_dir = None
+            self._cache_index_paths = []
+            return
+
+        samples_hash = self._compute_samples_hash()
+        cache_identifier = self._compute_cache_identifier(samples_hash)
+        self.cache_identifier = cache_identifier
+        self.cache_base_path = self.cache_dir / cache_identifier if self.cache_dir else None
+
+        if self.cache_base_path is None:
+            self.cache_enabled = False
+            self.cache_samples_dir = None
+            self._cache_index_paths = []
+            return
+
+        self.cache_base_path.mkdir(parents=True, exist_ok=True)
+        self.cache_samples_dir = self.cache_base_path / "samples"
+        self.cache_samples_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_index_paths = [self.cache_samples_dir / f"{idx:08d}.pkl" for idx in range(len(self.samples))]
+
+        metadata = {
+            "schema_version": 1,
+            "samples_hash": samples_hash,
+            "cacheable_steps": [step.cache_fingerprint() for step in self.cacheable_steps],
+        }
+        metadata_path = self.cache_base_path / "metadata.json"
+        try:
+            metadata_path.write_text(json.dumps(metadata, indent=2))
+        except Exception as exc:  # pragma: no cover - best-effort logging
+            logger.warning("Failed to write cache metadata to %s: %s", metadata_path, exc)
+
+        logger.info(
+            "Cache enabled for %s with %d samples; prefix steps: %s; cache dir: %s",
+            self.root_dir,
+            len(self.samples),
+            [step.__class__.__name__ for step in self.cacheable_steps],
+            self.cache_base_path,
+        )
+
+    def _compute_samples_hash(self) -> str:
+        """Build a hash capturing dataset contents to invalidate stale caches."""
+        hasher = hashlib.md5()
+
+        for sample in self.samples:
+            md_path = sample.get("markdown_path")
+            pdf_path = sample.get("pdf_path")
+
+            if md_path is not None:
+                resolved_md = Path(md_path).resolve()
+                hasher.update(str(resolved_md).encode("utf-8"))
+                try:
+                    stat = resolved_md.stat()
+                    hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
+                    hasher.update(str(stat.st_size).encode("utf-8"))
+                except (OSError, FileNotFoundError):
+                    pass
+
+            if pdf_path is not None:
+                resolved_pdf = Path(pdf_path).resolve()
+                hasher.update(str(resolved_pdf).encode("utf-8"))
+                try:
+                    stat = resolved_pdf.stat()
+                    hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
+                    hasher.update(str(stat.st_size).encode("utf-8"))
+                except (OSError, FileNotFoundError):
+                    pass
+
+        return hasher.hexdigest()
+
+    def _compute_cache_identifier(self, samples_hash: str) -> str:
+        """Derive a stable cache namespace from dataset configuration."""
+        step_fingerprint = "||".join(step.cache_fingerprint() for step in self.cacheable_steps)
+        root_signature = str(self.root_dir.resolve())
+        digest_source = f"{root_signature}||{samples_hash}||{step_fingerprint}".encode("utf-8")
+        digest = hashlib.md5(digest_source).hexdigest()
+        safe_root = re.sub(r"[^A-Za-z0-9_.-]", "_", self.root_dir.name)
+        return f"{safe_root}-{digest}"
+
+    def _apply_cacheable_steps(self, sample: Sample) -> Optional[Sample]:
+        """Apply cacheable steps sequentially."""
+        for step in self.cacheable_steps:
+            sample = step(sample)
+            if sample is None:
+                return None
+        return sample
+
+    def _load_cached_sample(self, idx: int) -> Any:
+        """Load cached preprocessing result for the given index."""
+        cache_file = self._cache_index_paths[idx]
+        if not cache_file.exists():
+            return _CACHE_MISS
+
+        try:
+            with cache_file.open("rb") as handle:
+                return pickle.load(handle)
+        except Exception as exc:  # pragma: no cover - best-effort logging
+            logger.warning("Failed to read cache file %s: %s; regenerating entry.", cache_file, exc)
+            try:
+                cache_file.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
+            return _CACHE_MISS
+
+    def _store_cached_sample(self, idx: int, sample: Optional[Sample]) -> None:
+        """Persist preprocessing result for the given index."""
+        cache_file = self._cache_index_paths[idx]
+        tmp_file = cache_file.parent / f"{cache_file.name}.tmp"
+
+        try:
+            with tmp_file.open("wb") as handle:
+                pickle.dump(sample, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp_file.replace(cache_file)
+        except Exception as exc:  # pragma: no cover - best-effort logging
+            logger.warning("Failed to write cache file %s: %s", cache_file, exc)
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +664,9 @@ class RotationAugmentation(PipelineStep):
 
     probability: float = 0.5  # Probability of applying rotation
 
+    def is_cacheable(self) -> bool:
+        return False
+
     def __call__(self, sample: Sample) -> Optional[Sample]:
         """Randomly rotate image and update rotation metadata."""
         # Only proceed with given probability
@@ -525,6 +752,9 @@ class AugraphyBasicAugmentations(PipelineStep):
     """Pipeline step that applies a decent selection of augraphy augmentations to the data"""
 
     probability: float = 0.5  # Overall probability of applying any augmentation
+
+    def is_cacheable(self) -> bool:
+        return False
 
     def __call__(self, sample: Sample) -> Optional[Sample]:
         """Apply augraphy augmentations to the image in the sample."""
@@ -724,6 +954,22 @@ class Tokenizer(PipelineStep):
 
         return sample
 
+    def cache_fingerprint(self) -> str:
+        processor_name = getattr(self.processor, "pretrained_model_name_or_path", None)
+        if processor_name is None:
+            processor_name = getattr(self.processor, "name_or_path", None)
+
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        tokenizer_name = None
+        if tokenizer is not None:
+            tokenizer_name = getattr(tokenizer, "name_or_path", None)
+
+        identifier = processor_name or tokenizer_name or self.processor.__class__.__name__
+        return (
+            f"Tokenizer(processor={identifier},masking_index={self.masking_index},"
+            f"end_of_message_token={self.end_of_message_token})"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RandomTokenFlipper(PipelineStep):
@@ -732,6 +978,9 @@ class RandomTokenFlipper(PipelineStep):
     valid_token_ids: List[int]  # List of valid token IDs to substitute with
     token_flip_rate: float = 1e-4
     masking_index: int = -100
+
+    def is_cacheable(self) -> bool:
+        return False
 
     def __call__(self, sample: Sample) -> Sample:
         """Randomly flip tokens in the non-masked portion of labels."""
@@ -766,7 +1015,13 @@ class RandomTokenFlipper(PipelineStep):
 class MarkdownPDFDocumentDataset(BaseMarkdownPDFDataset):
     """Dataset that includes front matter parsing and PDF rendering by default."""
 
-    def __init__(self, root_dir: str | PathLike, target_longest_image_dim: int, front_matter_class=None):
+    def __init__(
+        self,
+        root_dir: str | PathLike,
+        target_longest_image_dim: int,
+        front_matter_class=None,
+        cache_dir: Optional[str | PathLike] = None,
+    ):
         """
         Initialize the dataset with default pipeline steps.
 
@@ -786,7 +1041,7 @@ class MarkdownPDFDocumentDataset(BaseMarkdownPDFDataset):
         ]
 
         # Initialize base class with pipeline
-        super().__init__(root_dir, pipeline_steps)
+        super().__init__(root_dir, pipeline_steps, cache_dir=cache_dir)
 
 
 if __name__ == "__main__":
@@ -832,6 +1087,11 @@ if __name__ == "__main__":
         type=str,
         help="Save the processed image to the specified file path (e.g., output.png)",
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        help="Optional cache directory for dataset preprocessing",
+    )
 
     args = parser.parse_args()
 
@@ -876,7 +1136,7 @@ if __name__ == "__main__":
     print(f"Pipeline steps: {[step.__class__.__name__ for step in pipeline_steps]}")
 
     # Create dataset
-    dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps)
+    dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps, cache_dir=args.cache_dir)
 
     print(f"Dataset length: {len(dataset)}")
 

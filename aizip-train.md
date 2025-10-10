@@ -1,0 +1,1 @@
+python -m olmocr.train.train --config olmocr/train/configs/qwen25_vl_olmocrv3_1epoch-3b-cache.yaml

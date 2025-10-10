@@ -149,6 +149,7 @@ class DatasetConfig:
 
     train: List[Dict[str, Any]] = field(default_factory=list)
     eval: List[Dict[str, Any]] = field(default_factory=list)
+    cache_dir: Optional[str] = None
 
 
 @dataclass
@@ -331,6 +332,9 @@ class Config:
                     raise ValueError(f"Missing root_dir for {split_name} dataset {i}")
                 if not os.path.exists(root_dir):
                     raise ValueError(f"Dataset root directory does not exist: {root_dir}")
+
+        if self.dataset.cache_dir:
+            Path(self.dataset.cache_dir).mkdir(parents=True, exist_ok=True)
 
         # Model validation
         if self.model.load_in_8bit and self.model.load_in_4bit:
