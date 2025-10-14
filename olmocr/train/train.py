@@ -6,6 +6,7 @@ import argparse
 import logging
 import math
 import os
+from pathlib import Path
 import shutil
 from typing import Any, Dict, Optional
 
@@ -34,6 +35,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+for name in [
+    "pypdf",
+    "pypdf._cmap",
+    "pypdf.generic._data_structures",
+]:
+    logging.getLogger(name).setLevel(logging.CRITICAL)  # 屏蔽 WARNING/ERROR
 
 
 class QwenDataCollator:
@@ -250,9 +257,10 @@ def main():
     for i, dataset_cfg in enumerate(config.dataset.train):
         root_dir = dataset_cfg["root_dir"]
         pipeline_steps = config.get_pipeline_steps(dataset_cfg["pipeline"], processor)
+        cache_dir = dataset_cfg["cache_dir"]
 
         logger.info(f"Creating training dataset {i+1} from: {root_dir}")
-        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps)
+        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps, cache_dir=cache_dir)
         logger.info(f"Found {len(dataset)} samples")
 
         if len(dataset) > 0:
@@ -268,12 +276,13 @@ def main():
     for i, dataset_cfg in enumerate(config.dataset.eval):
         root_dir = dataset_cfg["root_dir"]
         pipeline_steps = config.get_pipeline_steps(dataset_cfg["pipeline"], processor)
+        cache_dir = dataset_cfg["cache_dir"]    
 
         # Use dataset name if provided, otherwise use root_dir as name
         dataset_name = dataset_cfg.get("name", f"eval_dataset_{i+1}")
 
         logger.info(f"Creating evaluation dataset '{dataset_name}' from: {root_dir}")
-        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps)
+        dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps, cache_dir=cache_dir)
         logger.info(f"Found {len(dataset)} samples")
 
         if len(dataset) > 0:

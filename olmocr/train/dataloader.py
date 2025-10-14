@@ -94,63 +94,110 @@ class PipelineStep(ABC):
 class BaseMarkdownPDFDataset(Dataset):
     """Base dataset class that loads and verifies markdown-PDF pairs."""
 
-    def __init__(self, root_dir: str | PathLike, pipeline_steps: Optional[List[PipelineStep]] = None):
+    def __init__(
+        self,
+        root_dir: str | PathLike,
+        pipeline_steps: Optional[List[PipelineStep]] = None,
+        cache_dir: Optional[str | PathLike] = None,
+    ):
         """
         Initialize the dataset by finding all markdown files with corresponding PDFs.
 
         Args:
             root_dir: Path to the root folder containing processed markdown and PDF files
             pipeline_steps: Optional list of pipeline steps to apply to each sample
+            cache_dir: Optional directory for caching dataset validation results
         """
-        self.root_dir = Path(root_dir)
+        self.root_dir = Path(root_dir).expanduser()
         self.pipeline_steps = pipeline_steps or []
-        self.samples = []
+        self.samples: List[Dict[str, Path]] = []
+        self._cache_dir: Optional[Path] = None
+        if cache_dir:
+            cache_path = Path(cache_dir).expanduser()
+            if not cache_path.is_absolute():
+                cache_path = self.root_dir / cache_path
+            self._cache_dir = cache_path
+        self._invalid_entries: List[Dict[str, Any]] = []
 
-        # Find all markdown files recursively
         logger.info(f"Scanning for markdown files in {self.root_dir}...")
-        md_files = list(self.root_dir.rglob("*.md"))
+        md_files = sorted(self.root_dir.rglob("*.md"))
 
-        # Verify each markdown file has a corresponding PDF using ProcessPoolExecutor
+        if not md_files:
+            logger.warning(f"No markdown files found in {self.root_dir}")
+            return
+
+        if self._cache_dir and self._try_load_cache(md_files):
+            logger.info(f"Using cached validation results from {self._cache_dir}")
+            if self._invalid_entries:
+                self._log_invalid_entries(self._invalid_entries)
+            return
+
         valid_count = 0
-        invalid_pdfs = []
+        invalid_entries: List[Dict[str, Any]] = []
+        missing_entries: List[Dict[str, Any]] = []
 
         logger.info(f"Validating {len(md_files)} markdown-PDF pairs using ProcessPoolExecutor...")
 
-        # Use ProcessPoolExecutor for parallel validation
-        with ProcessPoolExecutor(max_workers=8) as executor:
-            # Submit all validation tasks
+        import time
+
+        start_time = time.time()
+        with ProcessPoolExecutor(max_workers=128) as executor:
             future_to_md = {executor.submit(validate_pdf_pair, md_path): md_path for md_path in md_files}
 
-            # Process results as they complete
             with tqdm(total=len(md_files), desc="Validating PDFs") as pbar:
                 for future in as_completed(future_to_md):
                     md_path = future_to_md[future]
                     try:
                         valid_sample, invalid_pdf_info = future.result()
+                        if valid_sample is None and invalid_pdf_info is None:
+                            logger.warning(f"Valid sample and invalid PDF info for {md_path}")
+                            # pdf 缺失
+                            missing_entries.append({
+                                "markdown_path": md_path,
+                                "reason": "PDF missing",
+                            })
+                            
 
                         if valid_sample:
                             self.samples.append(valid_sample)
                             valid_count += 1
                         elif invalid_pdf_info:
-                            invalid_pdfs.append(invalid_pdf_info)
+                            invalid_entries.append(
+                                {
+                                    "markdown_path": md_path,
+                                    "pdf_path": invalid_pdf_info[0],
+                                    "reason": invalid_pdf_info[1],
+                                }
+                            )
 
                     except Exception as e:
                         logger.error(f"Error processing {md_path}: {str(e)}")
-                        invalid_pdfs.append((md_path.with_suffix(".pdf"), f"Processing error: {str(e)}"))
+                        invalid_entries.append(
+                            {
+                                "markdown_path": md_path,
+                                "pdf_path": md_path.with_suffix(".pdf"),
+                                "reason": f"Processing error: {str(e)}",
+                            }
+                        )
 
                     pbar.update(1)
 
-        # Sort samples by markdown path for consistent ordering across runs
+        end_time = time.time()
+        logger.info(f"Time taken to validate {len(md_files)} markdown-PDF pairs: {end_time - start_time:.2f} seconds, samples: {len(self.samples)}, valid: {valid_count}, invalid: {len(self._invalid_entries)}")
+
         self.samples.sort(key=lambda x: x["markdown_path"])
+        self._invalid_entries = invalid_entries
+        self.missing_entries = missing_entries
 
         logger.info(f"Found {valid_count} valid markdown-PDF pairs")
 
-        if invalid_pdfs:
-            logger.warning(f"{len(invalid_pdfs)} invalid PDFs found:")
-            for pdf_path, reason in invalid_pdfs[:5]:  # Show first 5
-                logger.warning(f"  - {pdf_path.name}: {reason}")
-            if len(invalid_pdfs) > 5:
-                logger.warning(f"  ... and {len(invalid_pdfs) - 5} more")
+        if self._invalid_entries:
+            self._log_invalid_entries(self._invalid_entries)
+
+        logger.info(f"{len(self.samples)} samples found, {valid_count} valid, {len(self._invalid_entries)} invalid, {len(self.missing_entries)} missing")
+
+        if self._cache_dir:
+            self._write_cache(self.samples, self._invalid_entries, self.missing_entries)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -177,6 +224,169 @@ class BaseMarkdownPDFDataset(Dataset):
                 return None
 
         return sample
+
+    def _cache_file_paths(self) -> Tuple[Path, Path]:
+        if not self._cache_dir:
+            raise ValueError("Cache directory is not configured")
+
+        valid_path = self._cache_dir / "valid.json"
+        invalid_path = self._cache_dir / "invalid.json"
+        missing_path = self._cache_dir / "missing.json"
+        return valid_path, invalid_path, missing_path
+
+    def _try_load_cache(self, markdown_paths: List[Path]) -> bool:
+        if not self._cache_dir:
+            return False
+
+        cache_dir = self._cache_dir
+        if not cache_dir.exists():
+            logger.info(f"Cache directory {cache_dir} does not exist; rebuilding cache")
+            return False
+
+        valid_path, invalid_path, missing_path = self._cache_file_paths()
+        if not valid_path.exists() or not invalid_path.exists() or not missing_path.exists():
+            logger.info(f"Cache files missing in {cache_dir}; rebuilding cache")
+            return False
+
+        try:
+            with valid_path.open("r", encoding="utf-8") as file:
+                valid_raw = json.load(file)
+            with invalid_path.open("r", encoding="utf-8") as file:
+                invalid_raw = json.load(file)
+            with missing_path.open("r", encoding="utf-8") as file:
+                missing_entries = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(f"Failed to load dataset cache from {cache_dir}: {exc}")
+            return False
+
+        total_cached = len(valid_raw) + len(invalid_raw) + len(missing_entries)
+
+        if total_cached != len(markdown_paths):
+            logger.info(
+                "Cached entries (%s) do not match current markdown count (%s); rebuilding cache",
+                total_cached,
+                len(markdown_paths),
+            )
+            return False
+
+        # cached_markdown = {
+        #     entry.get("markdown_path")
+        #     for entry in [*valid_raw, *invalid_raw]
+        #     if entry.get("markdown_path") is not None
+        # }
+        # current_markdown = {self._relative_to_root(path) for path in markdown_paths}
+
+        # if cached_markdown != current_markdown:
+        #     logger.info("Cached markdown set does not match current dataset; rebuilding cache")
+        #     return False
+
+        valid_samples: List[Dict[str, Path]] = []
+        for entry in valid_raw:
+            md_path = self._resolve_from_root(entry.get("markdown_path"))
+            pdf_path = self._resolve_from_root(entry.get("pdf_path"))
+            if md_path is None or pdf_path is None or not md_path.exists() or not pdf_path.exists():
+                logger.info("Cached valid entry references missing files; rebuilding cache")
+                return False
+            valid_samples.append({"markdown_path": md_path, "pdf_path": pdf_path})
+
+        invalid_entries: List[Dict[str, Any]] = []
+        for entry in invalid_raw:
+            md_path = self._resolve_from_root(entry.get("markdown_path"))
+            pdf_path = self._resolve_from_root(entry.get("pdf_path")) if entry.get("pdf_path") else None
+            reason = entry.get("reason", "")
+
+            if md_path is None or not md_path.exists():
+                logger.info("Cached invalid entry references missing markdown; rebuilding cache")
+                return False
+
+            invalid_entries.append({"markdown_path": md_path, "pdf_path": pdf_path, "reason": reason})
+
+        valid_samples.sort(key=lambda sample: sample["markdown_path"])
+
+        self.samples = valid_samples
+        self._invalid_entries = invalid_entries
+
+        logger.info(
+            f"Loaded {len(self.samples)} valid samples and {len(self._invalid_entries)} invalid entries from cache"
+        )
+        return True
+
+    def _write_cache(self, valid_samples: List[Dict[str, Path]], invalid_entries: List[Dict[str, Any]], missing_entries: List[Dict[str, Any]]) -> None:
+        if not self._cache_dir:
+            return
+
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        valid_path, invalid_path, missing_path = self._cache_file_paths()
+
+        valid_payload = [
+            {
+                "markdown_path": self._relative_to_root(sample["markdown_path"]),
+                "pdf_path": self._relative_to_root(sample["pdf_path"]),
+            }
+            for sample in valid_samples
+        ]
+
+        invalid_payload = [
+            {
+                "markdown_path": self._relative_to_root(entry["markdown_path"]),
+                "pdf_path": self._relative_to_root(entry["pdf_path"]) if entry.get("pdf_path") else None,
+                "reason": entry.get("reason", ""),
+            }
+            for entry in invalid_entries
+        ]
+
+        missing_payload = [
+            {
+                "markdown_path": self._relative_to_root(entry["markdown_path"]),
+                "reason": entry.get("reason", ""),
+            }
+            for entry in missing_entries
+        ]
+
+        try:
+            with valid_path.open("w", encoding="utf-8") as file:
+                json.dump(valid_payload, file, ensure_ascii=False, indent=2)
+            with invalid_path.open("w", encoding="utf-8") as file:
+                json.dump(invalid_payload, file, ensure_ascii=False, indent=2)
+            with missing_path.open("w", encoding="utf-8") as file:
+                json.dump(missing_payload, file, ensure_ascii=False, indent=2)
+            logger.info(f"Cached dataset validation results under {self._cache_dir}")
+        except OSError as exc:
+            logger.warning(f"Failed to write dataset cache to {self._cache_dir}: {exc}")
+
+    def _relative_to_root(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.root_dir))
+        except ValueError:
+            return str(path)
+
+    def _resolve_from_root(self, path_str: Optional[str]) -> Optional[Path]:
+        if path_str is None:
+            return None
+
+        path_obj = Path(path_str).expanduser()
+        if not path_obj.is_absolute():
+            path_obj = (self.root_dir / path_obj).resolve()
+        return path_obj
+
+    def _log_invalid_entries(self, invalid_entries: List[Dict[str, Any]]) -> None:
+        if not invalid_entries:
+            return
+
+        logger.warning(f"{len(invalid_entries)} invalid PDFs found:")
+        preview = invalid_entries[:5]
+        for entry in preview:
+            pdf_path = entry.get("pdf_path")
+            if isinstance(pdf_path, Path):
+                pdf_display = pdf_path.name
+            elif pdf_path:
+                pdf_display = str(pdf_path)
+            else:
+                pdf_display = "missing"
+            reason = entry.get("reason", "")
+            logger.warning(f"  - {pdf_display}: {reason}")
+        if len(invalid_entries) > len(preview):
+            logger.warning(f"  ... and {len(invalid_entries) - len(preview)} more")
 
 
 @dataclass(frozen=True, slots=True)

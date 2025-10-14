@@ -137,6 +137,7 @@ class DatasetItemConfig:
     """Configuration for a single dataset item."""
 
     root_dir: str
+    cache_dir: Optional[str] = None
     pipeline: List[Dict[str, Any]] = field(default_factory=list)
 
     # Optional sampling
