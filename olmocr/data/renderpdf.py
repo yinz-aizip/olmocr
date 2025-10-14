@@ -37,7 +37,13 @@ def get_pdf_media_box_width_height(local_pdf_path: str, page_num: int) -> tuple[
 
 
 def render_pdf_to_base64png(local_pdf_path: str, page_num: int, target_longest_image_dim: int = 2048) -> str:
-    longest_dim = max(get_pdf_media_box_width_height(local_pdf_path, page_num))
+    # Try to compute DPI based on MediaBox; if unavailable, fall back to a safe DPI
+    try:
+        longest_dim = max(get_pdf_media_box_width_height(local_pdf_path, page_num))
+        dpi = max(72, int(target_longest_image_dim * 72 / max(1.0, longest_dim)))
+    except Exception:
+        # Fallback DPI (kept moderate to avoid huge images while keeping readability)
+        dpi = 200
 
     # Convert PDF page to PNG using pdftoppm
     pdftoppm_result = subprocess.run(
@@ -49,14 +55,15 @@ def render_pdf_to_base64png(local_pdf_path: str, page_num: int, target_longest_i
             "-l",
             str(page_num),
             "-r",
-            str(target_longest_image_dim * 72 / longest_dim),  # 72 pixels per point is the conversion factor
+            str(dpi),
             local_pdf_path,
         ],
         timeout=120,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    assert pdftoppm_result.returncode == 0, pdftoppm_result.stderr
+    if pdftoppm_result.returncode != 0:
+        raise ValueError(f"pdftoppm failed: {pdftoppm_result.stderr.decode('utf-8', errors='ignore')}")
     return base64.b64encode(pdftoppm_result.stdout).decode("utf-8")
 
 

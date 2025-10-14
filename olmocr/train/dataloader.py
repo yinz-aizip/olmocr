@@ -284,16 +284,21 @@ class PDFRenderer(PipelineStep):
     target_longest_image_dim: int
 
     def __call__(self, sample: Sample) -> Sample:
-        """Render PDF to image."""
-        # Render PDF to image
-        base64_png = render_pdf_to_base64png(str(sample["pdf_path"]), page_num=1, target_longest_image_dim=self.target_longest_image_dim)
-        png_bytes = base64.b64decode(base64_png)
-        image = Image.open(BytesIO(png_bytes))
+        """Render PDF to image.
 
-        # Update sample
-        sample["image"] = image
-
-        return sample
+        Robust to PDF parsing/rendering failures: if render fails, return None to skip sample.
+        """
+        try:
+            base64_png = render_pdf_to_base64png(
+                str(sample["pdf_path"]), page_num=1, target_longest_image_dim=self.target_longest_image_dim
+            )
+            png_bytes = base64.b64decode(base64_png)
+            image = Image.open(BytesIO(png_bytes))
+            sample["image"] = image
+            return sample
+        except Exception as e:
+            logger.warning(f"PDFRenderer failed for {sample.get('pdf_path')}: {e}")
+            return None
 
 
 @dataclass(frozen=True, slots=True)
