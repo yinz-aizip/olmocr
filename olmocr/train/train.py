@@ -452,10 +452,10 @@ def main():
     }
 
     # Always evaluate on start
-    metrics = evaluate_model(model, eval_dataloaders, device)
-    logger.info(f"Initial evaluation: {metrics}")
-    if "wandb" in config.training.report_to:
-        wandb.log(metrics, step=global_step)
+    # metrics = evaluate_model(model, eval_dataloaders, device)
+    # logger.info(f"Initial evaluation: {metrics}")
+    # if "wandb" in config.training.report_to:
+    #     wandb.log(metrics, step=global_step)
 
     # Main training loop
     current_epoch = samples_seen / len(train_dataset)
@@ -470,19 +470,31 @@ def main():
         accumulated_loss = 0.0
         num_losses_accumulated = 0
 
-        # Create epoch iterator and skip samples if resuming
+        # Create epoch iterator and fast-skip by reconstructing a subset DataLoader
+        from torch.utils.data import Subset
+
         epoch_iterator = iter(train_dataloader)
         if samples_seen > 0:
             samples_to_skip = samples_seen % len(train_dataset)
-            batches_to_skip = samples_to_skip // config.training.per_device_train_batch_size
-            logger.info(f"Resuming training: skipping {batches_to_skip} batches ({samples_to_skip} samples) to reach position {samples_seen}")
-            for _ in range(batches_to_skip):
-                try:
-                    next(epoch_iterator)
-                except StopIteration:
-                    # We've reached the end of the epoch while skipping, create new iterator
-                    epoch_iterator = iter(train_dataloader)
-                    break
+            # 对齐到 batch 边界，避免构造不满批的前导样本
+            start_index = (samples_to_skip // config.training.per_device_train_batch_size) * config.training.per_device_train_batch_size
+            if start_index > 0 and start_index < len(train_dataset):
+                logger.info(
+                    f"Resuming training: fast-forward to index {start_index} (skipping ~{start_index} samples)"
+                )
+                remaining_indices = list(range(start_index, len(train_dataset)))
+                fast_subset = Subset(train_dataset, remaining_indices)
+                fast_loader = DataLoader(
+                    fast_subset,
+                    batch_size=config.training.per_device_train_batch_size,
+                    shuffle=False,  # 仅用于本 epoch 剩余部分的快速定位
+                    collate_fn=data_collator,
+                    num_workers=config.training.dataloader_num_workers,
+                    drop_last=config.training.dataloader_drop_last,
+                    worker_init_fn=seed_worker,
+                    generator=generator,
+                )
+                epoch_iterator = iter(fast_loader)
 
         # Create progress bar
         pbar = tqdm(total=max_train_samples - samples_seen, desc=f"Training from step {global_step}", unit="samples")
